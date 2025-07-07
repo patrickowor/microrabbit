@@ -188,7 +188,7 @@ class AbstractClient(ABC):
         future: asyncio.Future = self._futures.pop(message.correlation_id)
         future.set_result(message.body)
 
-    async def simple_publish(self, routing_key: str, body: Any, correlation_id=None, timeout: int = 10, decode=True) -> Union[bytes, str]:
+    async def simple_publish(self, routing_key: str, body: Any, correlation_id=None, timeout: int = 10, decode=True, reply=True) -> Union[bytes, str]:
         """
         Publish a message to the default exchange with a routing key and correlation id.
         :param routing_key: the routing key to use
@@ -202,7 +202,7 @@ class AbstractClient(ABC):
         if self._connection is None or not self._channel or not self._exchange:
             raise RuntimeError("Client not connected to RabbitMQ, call connect() or run() first")
 
-        if correlation_id is None:
+        if reply and correlation_id is None:
             correlation_id = str(uuid.uuid4())
 
         if not is_serializable(body):
@@ -218,32 +218,34 @@ class AbstractClient(ABC):
         loop = asyncio.get_running_loop()
         future = loop.create_future()
 
-        self._futures[correlation_id] = future
-        self._callbacks[correlation_id] = await self._channel.declare_queue(exclusive=True, auto_delete=True)
+        if reply:
+            self._futures[correlation_id] = future
+            self._callbacks[correlation_id] = await self._channel.declare_queue(exclusive=True, auto_delete=True)
 
-        await self._callbacks[correlation_id].consume(self._on_response, no_ack=True, exclusive=True, timeout=timeout) # type: ignore
+            await self._callbacks[correlation_id].consume(self._on_response, no_ack=True, exclusive=True, timeout=timeout) # type: ignore
 
         await self._exchange.publish(
             message=aio_pika.Message(
                 body=str(body).encode(),
                 content_type=content_type,
-                correlation_id=correlation_id,
-                reply_to=self._callbacks[correlation_id].name
+                correlation_id=correlation_id if reply else None,
+                reply_to=self._callbacks[correlation_id].name if reply else None
             ),
             routing_key=routing_key
         )
 
-        try:
-            response = await asyncio.wait_for(future, timeout=timeout)
+        if reply:
+            try:
+                response = await asyncio.wait_for(future, timeout=timeout)
 
-            if decode:
-                return response.decode()
-            return response
-        except asyncio.TimeoutError as e:
-            raise TimeoutError("The request timed out") from e
-        finally:
-            await self._channel.queue_delete(self._callbacks[correlation_id].name)
-            del self._callbacks[correlation_id]
+                if decode:
+                    return response.decode()
+                return response
+            except asyncio.TimeoutError as e:
+                raise TimeoutError("The request timed out") from e
+            finally:
+                await self._channel.queue_delete(self._callbacks[correlation_id].name)
+                del self._callbacks[correlation_id]
 
     @staticmethod
     async def publish(exchange: AbstractExchange, routing_key: str, correlation_id, body: Any):
